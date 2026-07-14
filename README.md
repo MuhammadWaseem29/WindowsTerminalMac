@@ -1,0 +1,1 @@
+Windows Terminal clone for macOS. This Electron application mimics the look and feel of Microsoft's Windows Terminal, offering multiple tabs, pane splitting, and customizable color schemes. It uses node-pty for terminal emulation and xterm.js for rendering. Run `npm install` then `npm start` to launch the terminal. You can customize settings via the config file.

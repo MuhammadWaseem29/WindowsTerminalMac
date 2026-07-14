@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Windows Terminal</title>
+  <link rel="stylesheet" href="./node_modules/@xterm/xterm/css/xterm.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      background: #0C0C0C; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-user-select: none; user-select: none;
+    }
+    body { display: flex; flex-direction: column; }
+
+    /* ═══════════════════════════════════════════════════
+       Titlebar — matches Windows Terminal TitlebarControl + MinMaxCloseControl
+       Specs (from XAML analysis): 40px tall windowed, 32px maximized
+       Layout: [tabs in col 0][drag area in col 1][min/max/close in col 2]
+       1px hairline (CardStrokeColorDefaultBrush) at bottom
+       ═══════════════════════════════════════════════════ */
+    #titlebar {
+      display: flex; align-items: stretch;
+      height: 40px; background: #0C0C0C; position: relative; flex-shrink: 0;
+      -webkit-app-region: drag;
+    }
+    #titlebar::after {
+      content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 1px;
+      background: #2B2B2B; z-index: 0;
+    }
+
+    /* Tab strip embedded in titlebar (showTabsInTitlebar=true, alwaysShowTabs=true) */
+    #tabs-in-titlebar {
+      flex: 1; display: flex; align-items: flex-end; padding: 0 4px 0 8px;
+      height: 100%;
+    }
+    .tab {
+      display: flex; align-items: center; height: 32px; padding: 0 12px;
+      margin: 0 1px; border-radius: 4px 4px 0 0; font-size: 12px; cursor: pointer;
+      max-width: 240px; min-width: 80px; color: #B5B5B5; background: transparent;
+      align-self: flex-end; -webkit-app-region: no-drag;
+    }
+    .tab.active {
+      color: #FFFFFF; background: #0C0C0C;
+      height: 33px; margin-bottom: -1px; position: relative; z-index: 1;
+    }
+    .tab:hover:not(.active) { background: rgba(255,255,255,0.08); color: #FFFFFF; }
+    .tab .tab-title {
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .tab .tab-close {
+      margin-left: 8px; margin-right: -2px; width: 18px; height: 18px;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 3px; opacity: 0; font-size: 10px;
+    }
+    .tab.active .tab-close, .tab:hover .tab-close { opacity: 0.9; }
+    .tab .tab-close:hover { background: rgba(255,255,255,0.3); opacity: 1; color: #fff; }
+
+    /* New-tab SplitButton — 28px tall, unified control matching WT SplitButton */
+    .newtab-wrap {
+      display: flex; align-items: stretch; margin: 0 4px 4px 2px; height: 28px;
+      border-radius: 4px; overflow: hidden; background: rgba(255,255,255,0.04);
+      align-self: flex-end;
+    }
+    .newtab-wrap:hover { background: rgba(255,255,255,0.10); }
+    /* Mark the whole SplitButton control as non-draggable so real mouse
+       clicks always reach the buttons (not the titlebar drag region). */
+    .newtab-wrap { -webkit-app-region: no-drag; }
+    #newtab-btn, #newtab-caret {
+      background: transparent; border: none; color: #E6E6E6; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      -webkit-app-region: no-drag;
+      /* Let clicks fall through to the <button> itself, never the inner SVG */
+      pointer-events: auto;
+    }
+    /* SVGs inside the titlebar must never intercept clicks/drags */
+    #titlebar svg { pointer-events: none; -webkit-app-region: no-drag; }
+    #newtab-btn { width: 36px; height: 100%; }
+    #newtab-btn:hover, #newtab-btn:active { color: #FFFFFF; background: rgba(255,255,255,0.06); }
+    #newtab-caret { width: 18px; height: 100%; }
+    #newtab-caret:hover { background: rgba(255,255,255,0.18); color: #FFFFFF; box-shadow: inset 1px 0 0 rgba(255,255,255,0.10); }
+    .wt-logo {
+      width: 16px; height: 16px; margin: 0 4px 0 8px; flex-shrink: 0;
+      background-color: transparent;
+      background-image: url("./assets/icon_256.png");
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: contain;
+      filter: drop-shadow(0 0 1px rgba(0,0,0,0.6)) brightness(1.6);
+    }
+
+    /* Caption buttons — specs: 46×40px windowed, glyph Segoe MDL2 */
+    .window-controls { display: flex; height: 100%; }
+    .window-controls button {
+      width: 46px; height: 100%; background: transparent; border: none;
+      color: #FFFFFF; font-size: 12px; cursor: pointer; -webkit-app-region: no-drag;
+      display: flex; align-items: center; justify-content: center; transition: background 0.15s;
+    }
+    .window-controls button:hover { background: rgba(255,255,255,0.12); }
+    .window-controls button.close:hover { background: #C42B1C; color: #fff; }
+    .window-controls button:active { background: rgba(255,255,255,0.06); }
+
+    /* ═══════════════════════════════════════════════════
+       Pane container
+       ═══════════════════════════════════════════════════ */
+    #panes {
+      flex: 1; position: relative; background: #0C0C0C; display: flex;
+      overflow: hidden;
+    }
+    .pane { position: relative; background: #0C0C0C; display: flex; padding: 8px; }
+    .pane .xterm { width: 100%; height: 100%; padding: 0; }
+    .pane.focused { box-shadow: inset 0 0 0 1px #3A96DD; }
+    /* XTerm scroll fixes — viewport bg must match pane bg #0C0C0C */
+    .pane .xterm .xterm-viewport { background-color: #0C0C0C !important; }
+    .xterm-viewport::-webkit-scrollbar { width: 12px; }
+    .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+    .xterm-viewport::-webkit-scrollbar-thumb {
+      background: #333; border: 3px solid #0C0C0C; border-radius: 6px;
+      background-clip: padding-box;
+    }
+    .xterm-viewport::-webkit-scrollbar-thumb:hover { background: #4a4a4a; }
+    .xterm-viewport::-webkit-scrollbar-corner { background: transparent; }
+
+    .pane-separator {
+      width: 1px; background: #1B1B1B; cursor: col-resize; flex-shrink: 0; position: relative;
+    }
+    .pane-separator::after {
+      content: ''; position: absolute; left: -3px; top: 0; bottom: 0; width: 7px;
+    }
+    .pane-separator.horizontal {
+      width: auto; height: 1px; cursor: row-resize;
+    }
+    .pane-separator.horizontal::after { left: 0; top: -2px; width: 100%; height: 5px; }
+
+    /* ═══════════════════════════════════════════════════
+       Status bar (bottom) — appears when zoom indicator or broadcast active
+       ═══════════════════════════════════════════════════ */
+    #statusbar {
+      height: 0; overflow: hidden; background: #0C0C0C; color: #CCC; font-size: 11px;
+      display: flex; align-items: center; padding: 0 12px; flex-shrink: 0;
+      border-top: 1px solid #1B1B1B;
+    }
+    #statusbar.visible { height: 24px; }
+
+    /* Split indicator overlay during resizing */
+    .pane-resizing-overlay {
+      position: absolute; inset: 0; background: rgba(58,150,221,0.05); pointer-events: none;
+    }
+
+    /* XTterm scroll fixes */
+    .xterm-viewport::-webkit-scrollbar { width: 12px; }
+    .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+    .xterm-viewport::-webkit-scrollbar-thumb { background: #333; }
+  </style>
+</head>
+<body>
+  <div id="titlebar">
+    <div id="tabs-in-titlebar">
+      <div class="wt-logo" title="Windows Terminal"></div>
+      <div id="tabs"></div>
+      <div class="newtab-wrap">
+        <button id="newtab-btn" type="button" title="New Tab (Cmd+Shift+T)">
+          <svg width="14" height="14" viewBox="0 0 14 14"><path d="M3 7H11 M7 3V11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+        <button id="newtab-caret" type="button" title="New Tab Menu (Ctrl+Shift+Space)">
+          <svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 2L4 6L7 2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="window-controls">
+      <button class="minimize" title="Minimize">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="4.75" width="9" height="1" fill="currentColor"/></svg>
+      </button>
+      <button class="maximize" title="Maximize">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.75" y="0.75" width="8.5" height="8.5" fill="none" stroke="currentColor" stroke-width="1.25"/></svg>
+      </button>
+      <button class="close" title="Close">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.25,1.25 L8.75,8.75 M8.75,1.25 L1.25,8.75" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+  <div id="panes"></div>
+  <div id="statusbar"></div>
+
+  <script src="./campbell.js"></script>
+  <script src="./renderer.js"></script>
+</body>
+</html>
