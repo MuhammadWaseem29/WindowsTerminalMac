@@ -1,5 +1,3 @@
-// With nodeIntegration:true and contextIsolation:false, we can expose ipcRenderer
-// directly. ETerminal preload runs before renderer scripts.
 const { ipcRenderer } = require('electron');
 
 window.wt = {
@@ -8,7 +6,6 @@ window.wt = {
   resizePty: (id, cols, rows) => ipcRenderer.invoke('pty-resize', { id, cols, rows }),
   killPty: (id) => ipcRenderer.invoke('pty-kill', { id }),
 
-  // Single global PTY event listeners (set up once)
   _ptyDataListeners: [],
   _ptyExitListeners: [],
   onPtyData: (cb) => {
@@ -26,10 +23,11 @@ window.wt = {
     };
   },
 
-  minimize: () => ipcRenderer.send('window-minimize'),
-  toggleMaximize: () => ipcRenderer.send('window-maximize'),
-  toggleFullscreen: () => ipcRenderer.send('window-toggle-fullscreen'),
-  newWindow: () => ipcRenderer.send('window-new'),
+  minimize:        () => ipcRenderer.invoke('window-minimize'),
+  toggleMaximize:  () => ipcRenderer.invoke('window-maximize'),
+  toggleFullscreen: () => ipcRenderer.invoke('window-toggle-fullscreen'),
+  newWindow:       () => ipcRenderer.invoke('window-new'),
+  close:           () => ipcRenderer.invoke('window-close'),
 };
 
 ipcRenderer.on('pty-data', (e, { id, data }) => {

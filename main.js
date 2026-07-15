@@ -1,11 +1,11 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, webContents } = require('electron');
 const path = require('path');
 const os = require('os');
 const pty = require('node-pty');
 const { execSync } = require('child_process');
 
-let mainWindow;
 const ptys = new Map();
+const windowPtyMap = new Map();
 let ptyIdCounter = 0;
 
 const DEFAULT_COLS = 120;
@@ -33,7 +33,7 @@ try {
 process.env.PATH = loginPath;
 
 function createWindow() {
-  mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     width: 1024,
     height: 700,
     minWidth: 400,
@@ -50,14 +50,37 @@ function createWindow() {
     }
   });
 
+  windowPtyMap.set(win.webContents.id, []);
+
   try {
     app.dock.setIcon(ICON_ICNS);
   } catch (e) { /* not on this platform */ }
 
-  mainWindow.loadFile('index.html');
+  win.loadFile('index.html');
   if (process.argv.some(a => a === '--dev' || a.startsWith('--dev='))) {
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+    win.webContents.openDevTools({ mode: 'detach' });
   }
+
+  win.on('closed', () => {
+    const ptyIds = windowPtyMap.get(win.webContents.id) || [];
+    for (const id of ptyIds) {
+      const e = ptys.get(id);
+      if (e && !e.killed) {
+        e.killed = true;
+        try { e.proc.kill(); } catch (e2) {}
+      }
+      ptys.delete(id);
+    }
+    windowPtyMap.delete(win.webContents.id);
+  });
+
+  return win;
+}
+
+function getWindowForEvent(event) {
+  const wc = event.sender;
+  if (wc && !wc.isDestroyed()) return BrowserWindow.fromWebContents(wc);
+  return null;
 }
 
 app.whenReady().then(() => {
@@ -78,18 +101,24 @@ app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) creat
 app.on('window-all-closed', () => {
   for (const [, e] of ptys) { e.killed = true; try { e.proc.kill(); } catch(e2){} }
   ptys.clear();
+  windowPtyMap.clear();
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
   for (const [, e] of ptys) { e.killed = true; try { e.proc.kill(); } catch(e2){} }
   ptys.clear();
+  windowPtyMap.clear();
 });
 
 ipcMain.handle('pty-create', (event, { cwd, cols, rows }) => {
-  if (mainWindow.isDestroyed()) return -1;
-  const shell = process.env.SHELL || '/bin/zsh';
-  const ptyProcess = pty.spawn(shell, [], {
+  const senderWin = getWindowForEvent(event);
+  if (!senderWin) return -1;
+
+  const userShell = process.env.SHELL;
+  const fs = require('fs');
+  const shell = (userShell && fs.existsSync(userShell)) ? userShell : '/bin/bash';
+  const ptyProcess = pty.spawn(shell, ['-i'], {
     name: 'xterm-256color',
     cols: cols || DEFAULT_COLS,
     rows: rows || DEFAULT_ROWS,
@@ -98,14 +127,17 @@ ipcMain.handle('pty-create', (event, { cwd, cols, rows }) => {
   });
 
   const id = ++ptyIdCounter;
-  const entry = { proc: ptyProcess, killed: false, exited: false };
+  const entry = { proc: ptyProcess, killed: false, exited: false, senderId: event.sender.id };
   ptys.set(id, entry);
+
+  const ptyList = windowPtyMap.get(event.sender.id);
+  if (ptyList) ptyList.push(id);
 
   ptyProcess.onData((data) => {
     if (entry.killed) return;
-    const w = mainWindow;
-    if (w && !w.isDestroyed() && w.webContents && !w.webContents.isDestroyed()) {
-      try { w.webContents.send('pty-data', { id, data }); } catch(e) {}
+    const wc = webContents.fromId(entry.senderId);
+    if (wc && !wc.isDestroyed()) {
+      try { wc.send('pty-data', { id, data }); } catch(e) {}
     }
   });
 
@@ -113,9 +145,9 @@ ipcMain.handle('pty-create', (event, { cwd, cols, rows }) => {
     if (entry.exited) return;
     entry.exited = true;
     if (!entry.killed) {
-      const w = mainWindow;
-      if (w && !w.isDestroyed() && w.webContents && !w.webContents.isDestroyed()) {
-        try { w.webContents.send('pty-exit', { id, exitCode }); } catch(e) {}
+      const wc = webContents.fromId(entry.senderId);
+      if (wc && !wc.isDestroyed()) {
+        try { wc.send('pty-exit', { id, exitCode }); } catch(e) {}
       }
     }
     ptys.delete(id);
@@ -143,15 +175,13 @@ ipcMain.handle('pty-kill', (event, { id }) => {
   }
 });
 
-function safeWin() { return (mainWindow && !mainWindow.isDestroyed()) ? mainWindow : null; }
-
-ipcMain.on('window-minimize', () => { const w = safeWin(); if (w) w.minimize(); });
-ipcMain.on('window-maximize', () => {
-  const w = safeWin(); if (!w) return;
+ipcMain.handle('window-minimize', (event) => { const w = getWindowForEvent(event); if (w) w.minimize(); });
+ipcMain.handle('window-maximize', (event) => {
+  const w = getWindowForEvent(event); if (!w) return;
   w.isMaximized() ? w.unmaximize() : w.maximize();
 });
-ipcMain.on('window-toggle-fullscreen', () => {
-  const w = safeWin(); if (!w) return;
+ipcMain.handle('window-toggle-fullscreen', (event) => {
+  const w = getWindowForEvent(event); if (!w) return;
   if (process.platform === 'darwin') {
     w.setSimpleFullScreen(!w.isSimpleFullScreen());
   } else {
@@ -161,7 +191,7 @@ ipcMain.on('window-toggle-fullscreen', () => {
 ipcMain.handle('window-new', () => {
   createWindow();
 });
-ipcMain.handle('window-close', () => { const w = safeWin(); if (w) w.close(); });
-ipcMain.handle('window-is-maximized', () => {
-  const w = safeWin(); return w ? w.isMaximized() : false;
+ipcMain.handle('window-close', (event) => { const w = getWindowForEvent(event); if (w) w.close(); });
+ipcMain.handle('window-is-maximized', (event) => {
+  const w = getWindowForEvent(event); return w ? w.isMaximized() : false;
 });

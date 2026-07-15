@@ -40,11 +40,13 @@ let activeTabId = 0;
 let tabIdCounter = 0;
 let paneIdCounter = 0;
 let currentFontSize = 12;
+let tabMru = []; // MRU order for tab switching (matches MS Terminal _mruTabs)
 
 // ── Pane binary tree ──────────────────────────────────────────────────
 // Mirrors Pane.cpp: leaf or Branch{first, second, splitState, separatorPos}
 // splitState: 'horizontal' (top/bottom) | 'vertical' (left/right)
 let paneTreeRoots = {}; // tabId -> root Pane node
+let tabContainers = {}; // tabId -> DOM container element (kept in #panes always)
 
 class PaneNode {
   constructor(opts) {
@@ -112,7 +114,7 @@ async function spawnPane(element, cwd) {
   });
 
   term.onData((d) => window.wt.writePty(ptyId, d));
-  term.onTitleChange((t) => { paneNode.title = t || 'Terminal'; renderTabs(activeTabId); });
+  term.onTitleChange((t) => { paneNode.title = t || 'Terminal'; renderTabs(activeTabId); updateTitle(); });
   term.onResize(({ cols, rows }) => window.wt.resizePty(ptyId, cols, rows));
 
   return paneNode;
@@ -125,8 +127,7 @@ async function newTab(cwd) {
   element.className = 'pane focused';
   element.style.flex = '1';
 
-  // Attach to a temporary offscreen container so xterm.js can measure,
-  // then we'll reattach properly via renderTree on rerender.
+  // Attach to a temporary offscreen container so xterm.js can measure
   const tempHost = document.createElement('div');
   tempHost.style.position = 'absolute';
   tempHost.style.left = '-9999px';
@@ -141,16 +142,23 @@ async function newTab(cwd) {
   const pane = await spawnPane(element, cwd);
   paneTreeRoots[tabId] = pane;
   tabs.push({ id: tabId, rootPaneId: pane.id, focusedPaneId: pane.id });
-  // Only take focus if nothing else claimed it while we were awaiting
   if (activeTabId === prevActive) activeTabId = tabId;
 
-  // Move the pane element out of the temp host and into the actual #panes
-  // via the proper tree renderer so future tab switches work correctly.
   if (tempHost.parentNode) tempHost.parentNode.removeChild(tempHost);
 
+  // Create a persistent container for this tab inside #panes
+  const panesHost = document.getElementById('panes');
+  const tabContainer = document.createElement('div');
+  tabContainer.style.cssText = 'display:flex;flex:1;position:absolute;inset:0;';
+  tabContainers[tabId] = tabContainer;
+  panesHost.appendChild(tabContainer);
+
+  // Render pane tree into the persistent container
+  renderTree(pane, tabContainer, pane.id);
+
   renderTabs(activeTabId);
-  rerenderActiveTabPanes();
-  attachClickHandlers(tabId);
+  attachClickHandlers();
+  showTab(tabId);
   toast('New tab #' + tabId);
   setTimeout(() => { try { pane.fit.fit(); } catch(e){} }, 60);
 }
@@ -160,11 +168,19 @@ function closeTab(tabId) {
   if (!tab) return;
   disposeTree(paneTreeRoots[tabId]);
   delete paneTreeRoots[tabId];
+  // Remove persistent container from DOM
+  if (tabContainers[tabId]) {
+    tabContainers[tabId].remove();
+    delete tabContainers[tabId];
+  }
   tabs = tabs.filter(t => t.id !== tabId);
+  tabMru = tabMru.filter(id => id !== tabId);
   if (tabs.length === 0) { window.wt.close(); return; }
-  if (activeTabId === tabId) activeTabId = tabs[0].id;
+  if (activeTabId === tabId) {
+    activeTabId = tabMru.length > 0 ? tabMru[0] : tabs[0].id;
+  }
   renderTabs(activeTabId);
-  rerenderActiveTabPanes();
+  showTab(activeTabId);
 }
 
 function disposeTree(node) {
@@ -217,6 +233,7 @@ async function splitPane(tabId, direction) {
   // Convert target leaf to branch (Pane.cpp:2275)
   const oldFirstId = targetPane.id;
   const oldPtyId = targetPane.ptyId;
+  targetPane.id = ++paneIdCounter; // branch gets a new unique ID
   targetPane.splitState = isVertical ? 'vertical' : 'horizontal';
   targetPane.separatorPos = 0.5;
   targetPane.first = new PaneNode({ id: oldFirstId, ptyId: oldPtyId, term: targetPane.term, fit: targetPane.fit, element: targetPane.element });
@@ -287,6 +304,7 @@ function findParentOf(node, id, parent = null) {
 }
 
 // ── Focus navigation (matches Pane::NavigateDirection) ───────────────
+// Only toggles focused class + transfers keyboard focus — NO tree rebuild
 function moveFocus(tabId, direction) {
   const tab = tabs.find(t => t.id === tabId);
   if (!tab) return;
@@ -314,19 +332,29 @@ function moveFocus(tabId, direction) {
       case 'up':     primary = -dy; secondary = Math.abs(dx); require = dy < 0; break;
       case 'previous': {
         const idx = leaves.findIndex(l => l.p === cur);
-        best = leaves[idx > 0 ? idx - 1 : 0].p;
+        best = leaves[idx > 0 ? idx - 1 : leaves.length - 1].p;
         break;
       }
       default: continue;
     }
-    if (direction === 'previous') { if (best) { tab.focusedPaneId = best.id; rerenderActiveTabPanes(); } return; }
+    if (direction === 'previous') {
+      if (best) {
+        tab.focusedPaneId = best.id;
+        cur.element.classList.remove('focused');
+        best.element.classList.add('focused');
+        focusActiveTerminal();
+      }
+      return;
+    }
     if (!require) continue;
     const score = primary + secondary * 0.5;
     if (score < bestScore) { bestScore = score; best = p; }
   }
   if (best) {
     tab.focusedPaneId = best.id;
-    rerenderActiveTabPanes();
+    cur.element.classList.remove('focused');
+    best.element.classList.add('focused');
+    focusActiveTerminal();
   }
 }
 
@@ -356,24 +384,80 @@ function resizePane(tabId, direction) {
   rerenderActiveTabPanes();
 }
 
-// ── Panes layout (binary tree -> flexbox) ────────────────────────────
+// ── Focus management (matches Tab::Focus() → TermControl::Focus()) ──
+function focusActiveTerminal() {
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (!tab) return;
+  const leaf = findPaneById(paneTreeRoots[activeTabId], tab.focusedPaneId);
+  if (leaf?.term) {
+    try { leaf.term.focus(); } catch(e) {}
+  }
+}
+
+function updateTitle() {
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (!tab) return;
+  const leaf = findPaneById(paneTreeRoots[activeTabId], tab.focusedPaneId);
+  document.title = (leaf?.title || 'Windows Terminal') + ' — Windows Terminal';
+}
+
+// ── Container visibility toggle ──────────────────────────────────────
+function setActiveContainer(tabId) {
+  for (const tid in tabContainers) {
+    tabContainers[tid].style.display = (Number(tid) === tabId) ? 'flex' : 'none';
+  }
+}
+
+// ── MRU tab tracking (matches MS Terminal _UpdateMRUTab) ─────────────
+function updateMru(tabId) {
+  tabMru = tabMru.filter(id => id !== tabId);
+  tabMru.unshift(tabId);
+}
+
+// ── Tab switching (visibility toggle only, NO DOM rebuild) ───────────
+// Matches MS Terminal: Tab::Focus() transfers keyboard focus, never rebuilds UI
+function showTab(tabId) {
+  const tab = tabs.find(t => t.id === tabId);
+  if (!tab) return;
+  activeTabId = tabId;
+  updateMru(tabId);
+
+  setActiveContainer(tabId);
+
+  // Fit + focus the active terminal (matches TermControl.Focus())
+  setTimeout(() => {
+    const tab = tabs.find(t => t.id === tabId);
+    if (!tab) return;
+    collectLeaves(paneTreeRoots[tabId]).forEach(p => {
+      try { p.fit?.fit(); } catch(e) {}
+    });
+    focusActiveTerminal();
+    updateTitle();
+  }, 10);
+}
+
+// ── Pane tree rebuild (only when tree structure mutates) ─────────────
 function rerenderActiveTabPanes() {
-  // Close any open find overlay since the pane tree changed
   const fo = document.getElementById('find-overlay');
   if (fo) fo.remove();
   findOpen = false;
 
-  const container = document.getElementById('panes');
+  setActiveContainer(activeTabId);
+
   const tab = tabs.find(t => t.id === activeTabId);
-  if (!tab) { container.replaceChildren(); return; }
+  const container = tabContainers[activeTabId];
+  if (!tab || !container) return;
   const root = paneTreeRoots[activeTabId];
-  if (!root) { container.replaceChildren(); return; }
-  // Use replaceChildren to move existing nodes (no detach/reattach flicker)
-  const frag = document.createDocumentFragment();
-  renderTree(root, frag, tab.focusedPaneId);
-  container.replaceChildren(frag);
+  if (!root) return;
+
+  // Re-render the tree inside the persistent container
+  container.replaceChildren();
+  renderTree(root, container, tab.focusedPaneId);
+
   setTimeout(() => {
     collectLeaves(root).forEach(p => { try { p.fit?.fit(); } catch(e){} });
+    focusActiveTerminal();
+    updateTitle();
   }, 30);
 }
 
@@ -442,7 +526,7 @@ function startDragResize(e, node, sepEl, splitState) {
 // listeners that all fired. Now we attach one listener that always uses
 // the active tab's tree to resolve pane focus.
 let _paneFocusHandlerAttached = false;
-function attachClickHandlers(tabId) {
+function attachClickHandlers() {
   if (_paneFocusHandlerAttached) return;
   _paneFocusHandlerAttached = true;
   document.getElementById('panes').addEventListener('mousedown', (e) => {
@@ -454,8 +538,11 @@ function attachClickHandlers(tabId) {
     const leaves = collectLeaves(paneTreeRoots[activeTabId]);
     const found = leaves.find(p => p.element === el);
     if (found) {
+      const oldLeaf = findPaneById(paneTreeRoots[activeTabId], tab.focusedPaneId);
       tab.focusedPaneId = found.id;
-      rerenderActiveTabPanes();
+      if (oldLeaf?.element) oldLeaf.element.classList.remove('focused');
+      found.element.classList.add('focused');
+      focusActiveTerminal();
       renderTabs(activeTabId);
     }
   }, true);
@@ -468,7 +555,7 @@ function renderTabs(highlightId) {
   tabs.forEach((tab, i) => {
     const el = document.createElement('div');
     el.className = 'tab' + (tab.id === highlightId ? ' active' : '');
-    el.onclick = () => { activeTabId = tab.id; renderTabs(activeTabId); rerenderActiveTabPanes(); };
+    el.onclick = () => { showTab(tab.id); renderTabs(tab.id); };
     const title = document.createElement('div');
     title.className = 'tab-title';
     const firstLeaf = collectLeaves(paneTreeRoots[tab.id])[0];
@@ -495,14 +582,11 @@ document.querySelector('.close').onclick = () => window.wt.close();
 let _newTabLock = 0;
 function doNewTab() {
   const now = Date.now();
-  if (now - _newTabLock < 400) return;   // debounce: ignore within 400ms
+  if (now - _newTabLock < 400) return;
   _newTabLock = now;
-  // Open a new window which will create its own tab on load
-  try {
-    window.wt.newWindow();
-  } catch (e) {
+  window.wt.newWindow().catch((e) => {
     showError('newWindow failed: ' + (e && e.message ? e.message : e));
-  }
+  });
 }
 document.getElementById('newtab-btn').addEventListener('pointerdown', (e) => {
   e.preventDefault();
@@ -600,8 +684,10 @@ function adjustFontSize(delta) {
   currentFontSize = Math.max(6, Math.min(32, currentFontSize + delta));
   tabs.forEach(t => collectLeaves(paneTreeRoots[t.id]).forEach(p => {
     p.term.options.fontSize = currentFontSize;
-    try { p.fit?.fit(); } catch(e){}
   }));
+  // Only fit the active tab (inactive tabs have zero dimensions)
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (tab) collectLeaves(paneTreeRoots[activeTabId]).forEach(p => { try { p.fit?.fit(); } catch(e){} });
 }
 
 // ── Clear buffer (Terminal.ClearBuffer) ────────────────────────────────
@@ -616,20 +702,21 @@ function clearBuffer() {
 function switchToTab(index) {
   if (tabs.length === 0) return;
   index = Math.max(0, Math.min(index, tabs.length - 1));
-  activeTabId = tabs[index].id;
-  renderTabs(activeTabId);
-  rerenderActiveTabPanes();
+  showTab(tabs[index].id);
+  renderTabs(tabs[index].id);
 }
 
 function nextTab() {
   const i = tabs.findIndex(t => t.id === activeTabId);
-  activeTabId = tabs[(i + 1) % tabs.length].id;
-  renderTabs(activeTabId); rerenderActiveTabPanes();
+  const next = tabs[(i + 1) % tabs.length].id;
+  showTab(next);
+  renderTabs(next);
 }
 function prevTab() {
   const i = tabs.findIndex(t => t.id === activeTabId);
-  activeTabId = tabs[(i - 1 + tabs.length) % tabs.length].id;
-  renderTabs(activeTabId); rerenderActiveTabPanes();
+  const prev = tabs[(i - 1 + tabs.length) % tabs.length].id;
+  showTab(prev);
+  renderTabs(prev);
 }
 
 // ── Find (Terminal.FindText — basic implementation) ───────────────────
@@ -686,19 +773,18 @@ document.addEventListener('keydown', (e) => {
   if (!tab) return;
 
   // ── Application-level (Cmd+) ──
-  // Cmd+Shift+T — new tab (Terminal.OpenNewTab)
-  if (cmd && shift && key === 't') { e.preventDefault(); newTab(); return; }
+  // Cmd+Shift+T — new tab in same window (Terminal.OpenNewTab)
+  if (cmd && shift && key === 't') { e.preventDefault(); newTab().catch(err => showError('newTab failed: ' + (err && err.message ? err.message : err))); return; }
   // Cmd+Shift+W — close pane (Terminal.ClosePane)
   if (cmd && shift && key === 'w') {
     e.preventDefault(); closePane(activeTabId, tab.focusedPaneId); return;
   }
   // Cmd+Shift+D — duplicate tab (Terminal.DuplicateTab) → open new tab
-  if (cmd && shift && key === 'd') { e.preventDefault(); newTab(); return; }
-  // Cmd+Shift+N — new window (Terminal.OpenNewWindow) — spawn new electron process
+  if (cmd && shift && key === 'd') { e.preventDefault(); newTab().catch(err => showError('duplicateTab failed: ' + (err && err.message ? err.message : err))); return; }
+  // Cmd+Shift+N — new window (Terminal.OpenNewWindow)
   if (cmd && shift && key === 'n') {
     e.preventDefault();
-    // Notify main process; main.js handles actual window creation
-    window.wt.newWindow();
+    window.wt.newWindow().catch(err => showError('newWindow failed: ' + (err && err.message ? err.message : err)));
     return;
   }
   // Cmd+Shift+F — find (Terminal.FindText)
@@ -725,7 +811,7 @@ document.addEventListener('keydown', (e) => {
   // Ctrl+Alt+1..9 — switch to tab N (Terminal.SwitchToTab0..8 + SwitchToLastTab)
   if (ctrl && alt && /^[1-9]$/.test(key)) {
     e.preventDefault();
-    if (key === '9') { activeTabId = tabs[tabs.length - 1]?.id; if (activeTabId) { renderTabs(activeTabId); rerenderActiveTabPanes(); } }
+    if (key === '9') { const last = tabs[tabs.length - 1]?.id; if (last) { showTab(last); renderTabs(last); } }
     else switchToTab(parseInt(key) - 1);
     return;
   }
@@ -823,10 +909,11 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// ── Window resize handler (fit all panes) ─────────────────────────────
+// ── Window resize handler (fit active tab's panes only) ──────────────
 window.addEventListener('resize', () => {
-  tabs.forEach(t => collectLeaves(paneTreeRoots[t.id]).forEach(p => { try { p.fit?.fit(); } catch(e){} }));
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (tab) collectLeaves(paneTreeRoots[activeTabId]).forEach(p => { try { p.fit?.fit(); } catch(e){} });
 });
 
 // ── Boot — open first tab ─────────────────────────────────────────────
-newTab();
+newTab().catch(err => showError('Boot failed: ' + (err && err.message ? err.message : err)));
