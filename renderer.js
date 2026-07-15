@@ -584,8 +584,8 @@ function doNewTab() {
   const now = Date.now();
   if (now - _newTabLock < 400) return;
   _newTabLock = now;
-  window.wt.newWindow().catch((e) => {
-    showError('newWindow failed: ' + (e && e.message ? e.message : e));
+  newTab().catch((e) => {
+    showError('newTab failed: ' + (e && e.message ? e.message : e));
   });
 }
 document.getElementById('newtab-btn').addEventListener('pointerdown', (e) => {
